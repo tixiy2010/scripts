@@ -1,1 +1,1268 @@
+-- ============================================================
+--  EVADE: SPEED (фикс разворота) + ESP + НИКИ + КОНФИГ
+--  GUI: клавиша V | Конфиг: tixiydev/evade.txt
+-- ============================================================
 
+-- ============================================================
+--  ЧАСТЬ 0: КОНФИГ
+-- ============================================================
+local CONFIG_FOLDER = "tixiydev"
+local CONFIG_FILE = "evade.txt"
+local CONFIG_PATH = CONFIG_FOLDER .. "/" .. CONFIG_FILE
+
+local function ensureFolder()
+	if isfolder and makefolder and not isfolder(CONFIG_FOLDER) then
+		pcall(makefolder, CONFIG_FOLDER)
+	end
+end
+
+local function loadConfig()
+	ensureFolder()
+	local defaults = { topSpeed = 60, maxSpeed = 90 }
+	if not (isfile and readfile) then return defaults end
+	if not isfile(CONFIG_PATH) then return defaults end
+	local ok, content = pcall(readfile, CONFIG_PATH)
+	if not ok or not content then return defaults end
+	local result = { topSpeed = defaults.topSpeed, maxSpeed = defaults.maxSpeed }
+	for key, value in string.gmatch(content, "([%w_]+)%s*=%s*([%d%.%-]+)") do
+		local num = tonumber(value)
+		if num then result[key] = num end
+	end
+	return result
+end
+
+local function saveConfig(data)
+	ensureFolder()
+	if not writefile then return end
+	local lines = {
+		"-- Evade config (tixiydev)",
+		"-- auto-generated, можно редактировать вручную",
+		"topSpeed=" .. tostring(math.floor((data.topSpeed or 60) + 0.5)),
+		"maxSpeed=" .. tostring(math.floor((data.maxSpeed or 90) + 0.5)),
+	}
+	pcall(writefile, CONFIG_PATH, table.concat(lines, "\n"))
+end
+
+local _savedCfg = loadConfig()
+getgenv().Evade = getgenv().Evade or {}
+getgenv().Evade.topSpeed = _savedCfg.topSpeed
+getgenv().Evade.maxSpeed = _savedCfg.maxSpeed
+getgenv().Evade._save = function()
+	saveConfig(getgenv().Evade)
+end
+
+-- ============================================================
+--  ЧАСТЬ 1: SPEED
+-- ============================================================
+local plr = game:GetService("Players").LocalPlayer
+local repstorage = game:GetService("ReplicatedStorage")
+
+local cfg = getgenv().Evade
+
+local funcs = require(repstorage:WaitForChild("Objects").Game.Character.Client.Movement.MoveFunction.Functions)
+
+local strafeCut, backCut = 0.65, 0.4
+local accel, turn = 80, 10
+local gain, decay, swingRef = 25, 8, 5
+local ease, drag, brake = 70, 18, 200
+local scale = 90
+
+-- Порог разворота: dot < 0.5 → угол > ~60°
+local TURN_RESET_DOT = 0.5
+
+if not getgenv().Evd then
+	getgenv().Evd = true
+
+	local spd, extra = 0, 0
+	local lastY = 0
+	local lastLocalWish = nil
+
+	local function step(dt, data, mover, state, grounded)
+		if not (mover and mover.BaseMover) then return mover, state end
+
+		local look = data:Get("LookCFrame")
+		local input = data:Get("MoveDirection") or Vector3.zero
+
+		-- Локальный ввод — для детекта разворота
+		local localWish = Vector2.new(input.X, input.Z)
+		local moving = localWish.Magnitude > 0.05
+
+		-- ★ Детект резкого разворота по ЛОКАЛЬНОМУ вводу
+		-- (поворот камеры при зажатом W не триггерит, т.к. локальный ввод не меняется)
+		if moving then
+			local newLocal = localWish.Unit
+			if lastLocalWish then
+				local dot = newLocal:Dot(lastLocalWish)
+				if dot < TURN_RESET_DOT then
+					spd = 0
+					extra = 0
+					mover.BaseMover.PlaneVelocity = Vector2.new(0, 0)
+					if state and state.Velocity then
+						state.Velocity = Vector3.new(0, state.Velocity.Y, 0)
+					end
+				end
+			end
+			lastLocalWish = newLocal
+		else
+			lastLocalWish = nil
+		end
+
+		-- ★ МИРОВОЕ направление движения — как в оригинале
+		local world = look and look:VectorToWorldSpace(input) or input
+		local wish = Vector2.new(world.X, world.Z)
+		local moveDir = moving and wish.Unit or Vector2.new(0, 0)
+
+		local face = look and Vector2.new(look.LookVector.X, look.LookVector.Z) or Vector2.new(0, -1)
+		if face.Magnitude > 0 then face = face.Unit end
+
+		local align = 1
+		if moving and face.Magnitude > 0 then
+			align = moveDir:Dot(face)
+		end
+
+		local cut
+		if align >= 0 then
+			cut = strafeCut + (1 - strafeCut) * align
+		else
+			cut = math.max(backCut, strafeCut + (strafeCut - backCut) * align)
+		end
+
+		local y = look and math.atan2(look.LookVector.X, look.LookVector.Z) or lastY
+		local dy = (y - lastY + math.pi) % (2 * math.pi) - math.pi
+		lastY = y
+		local swing = dt > 0 and math.clamp(math.abs(dy) / dt / swingRef, 0, 1) or 0
+		extra = math.clamp(extra + ((moving and swing * gain or 0) - decay) * dt, 0, cfg.maxSpeed - cfg.topSpeed)
+
+		local target = moving and (cfg.topSpeed + extra) * cut or 0
+		if spd < target then
+			spd = math.min(target, spd + accel * dt)
+		else
+			spd = math.max(target, spd - (moving and ease or (grounded and brake or drag)) * dt)
+		end
+
+		local v = moveDir * (spd * scale)
+
+		mover.BaseMover.PlaneVelocity = v
+		if state and state.Velocity then
+			state.Velocity = Vector3.new(v.X, state.Velocity.Y, v.Y)
+		end
+		return mover, state
+	end
+
+	local run, air = funcs.Run, funcs.Air
+
+	funcs.Run = function(dt, m, data, char, stats)
+		local mover, state = run(dt, m, data, char, stats)
+		return step(dt, data, mover, state, true)
+	end
+
+	funcs.Air = function(dt, m, data, char, stats)
+		local mover, state = air(dt, m, data, char, stats)
+		return step(dt, data, mover, state, false)
+	end
+end
+
+-- ============================================================
+--  ЧАСТЬ 2: ESP
+-- ============================================================
+local Workspace = game:GetService("Workspace")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CoreGui = game:GetService("CoreGui")
+local UIS = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+local BotFolder = Workspace:WaitForChild("Players", 10)
+local EffectsFolder = Workspace:WaitForChild("Effects", 10)
+
+local TicketsFolder = Workspace:WaitForChild("Tickets", 10)
+if not TicketsFolder and EffectsFolder then
+	TicketsFolder = EffectsFolder:WaitForChild("Tickets", 10)
+end
+
+if not BotFolder then return end
+if not EffectsFolder then return end
+if not TicketsFolder then return end
+
+local abs, atan2, cos, sin, floor, clamp, max = math.abs, math.atan2, math.cos, math.sin, math.floor, math.clamp, math.max
+local InstNew = Instance.new
+local Col3RGB = Color3.fromRGB
+local Col3New = Color3.new
+
+local BOT_SPEED = 33
+local DOWNED_HIDE_DISTANCE = 4
+local DOWNED_HIDE_DURATION = 2
+local ticketESPConnections = {}
+
+local function getESPContainer()
+	local success, result = pcall(function()
+		local container = CoreGui:FindFirstChild("ESP_Container")
+		if not container then
+			container = InstNew("Folder")
+			container.Name = "ESP_Container"
+			container.Parent = CoreGui
+		end
+		return container
+	end)
+	if success and result then return result end
+
+	local pg = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+	if pg then
+		local container = pg:FindFirstChild("ESP_Container")
+		if not container then
+			container = InstNew("Folder")
+			container.Name = "ESP_Container"
+			container.Parent = pg
+		end
+		return container
+	end
+	return nil
+end
+
+local espContainer = getESPContainer()
+if not espContainer then return end
+
+local activeESPElements = {}
+
+local function cleanupESP(object)
+	local uniqueId = object:GetDebugId()
+	if activeESPElements[uniqueId] then
+		for _, element in ipairs(activeESPElements[uniqueId]) do
+			if element and element.Parent then element:Destroy() end
+		end
+		activeESPElements[uniqueId] = nil
+	end
+	for _, child in ipairs(espContainer:GetChildren()) do
+		if string.find(child.Name, "_" .. uniqueId) then child:Destroy() end
+	end
+end
+
+local function registerESPElement(object, element)
+	local uniqueId = object:GetDebugId()
+	if not activeESPElements[uniqueId] then activeESPElements[uniqueId] = {} end
+	table.insert(activeESPElements[uniqueId], element)
+end
+
+-- ====== TICKET ESP ======
+local function applyTicketESP(object)
+	if not object or (not object:IsA("BasePart") and not object:IsA("Model")) then return end
+
+	local existingHighlight = object:FindFirstChild("TicketESP_Highlight")
+	local existingBillboard = object:FindFirstChild("TicketESP_Billboard")
+	if existingHighlight then existingHighlight:Destroy() end
+	if existingBillboard then existingBillboard:Destroy() end
+
+	if ticketESPConnections[object] then
+		ticketESPConnections[object]:Disconnect()
+		ticketESPConnections[object] = nil
+	end
+
+	local targetPart = object
+	if object:IsA("Model") then
+		targetPart = object:FindFirstChildWhichIsA("BasePart") or object.PrimaryPart
+		if not targetPart then return end
+	end
+
+	local highlight = InstNew("Highlight")
+	highlight.Name = "TicketESP_Highlight"
+	highlight.Adornee = object
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.FillColor = Col3RGB(0, 150, 255)
+	highlight.OutlineColor = Col3RGB(255, 255, 255)
+	highlight.FillTransparency = 0.6
+	highlight.OutlineTransparency = 0
+	highlight.Parent = espContainer
+
+	local bgui = InstNew("BillboardGui")
+	bgui.Name = "TicketESP_Billboard"
+	bgui.Adornee = targetPart
+	bgui.Size = UDim2.new(0, 100, 0, 25)
+	bgui.StudsOffset = Vector3.new(0, 2, 0)
+	bgui.AlwaysOnTop = true
+	bgui.Parent = espContainer
+
+	local textLabel = InstNew("TextLabel")
+	textLabel.BackgroundTransparency = 1
+	textLabel.Size = UDim2.new(1, 0, 1, 0)
+	textLabel.TextColor3 = Col3RGB(0, 150, 255)
+	textLabel.TextStrokeColor3 = Col3New(0, 0, 0)
+	textLabel.TextStrokeTransparency = 0
+	textLabel.TextSize = 12
+	textLabel.Font = Enum.Font.SourceSansBold
+	textLabel.Text = "bubbles"
+	textLabel.Parent = bgui
+
+	local conn = object.AncestryChanged:Connect(function(_, parent)
+		if not parent then
+			highlight:Destroy()
+			bgui:Destroy()
+			if ticketESPConnections[object] then
+				ticketESPConnections[object]:Disconnect()
+				ticketESPConnections[object] = nil
+			end
+		end
+	end)
+	ticketESPConnections[object] = conn
+end
+
+local function setupTicketsESP()
+	for _, child in ipairs(TicketsFolder:GetChildren()) do applyTicketESP(child) end
+	TicketsFolder.ChildAdded:Connect(function(child)
+		task.wait(0.1)
+		applyTicketESP(child)
+	end)
+end
+
+-- ====== ESP НИКОВ ИГРОКОВ ======
+local playerNameESP = {}
+
+local function cleanupPlayerNameESP(userId)
+	local data = playerNameESP[userId]
+	if not data then return end
+	if data.billboard and data.billboard.Parent then data.billboard:Destroy() end
+	if data.conns then
+		for _, c in ipairs(data.conns) do
+			pcall(function()
+				if c.Connected then c:Disconnect() end
+			end)
+		end
+	end
+	playerNameESP[userId] = nil
+end
+
+local function applyPlayerNameESP(player, char)
+	if not player or not char then return end
+	if player == LocalPlayer then return end
+	if char ~= player.Character then return end
+
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not root then
+		local conn
+		conn = char.ChildAdded:Connect(function(c)
+			if c.Name == "HumanoidRootPart" then
+				conn:Disconnect()
+				task.wait(0.1)
+				applyPlayerNameESP(player, char)
+			end
+		end)
+		task.delay(5, function()
+			if conn and conn.Connected then conn:Disconnect() end
+		end)
+		return
+	end
+
+	local userId = player.UserId
+	if playerNameESP[userId] then
+		local existing = playerNameESP[userId].billboard
+		if existing and existing.Adornee == root and existing.Parent then
+			return
+		else
+			cleanupPlayerNameESP(userId)
+		end
+	end
+
+	local displayName = player.DisplayName
+
+	local bgui = InstNew("BillboardGui")
+	bgui.Name = "PlayerName_BB_" .. userId
+	bgui.Adornee = root
+	bgui.Size = UDim2.new(0, 160, 0, 28)
+	bgui.StudsOffset = Vector3.new(0, 3.2, 0)
+	bgui.AlwaysOnTop = true
+	bgui.Parent = espContainer
+
+	local nameLabel = InstNew("TextLabel")
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Size = UDim2.new(1, 0, 1, 0)
+	nameLabel.TextColor3 = Col3RGB(120, 220, 255)
+	nameLabel.TextStrokeColor3 = Col3New(0, 0, 0)
+	nameLabel.TextStrokeTransparency = 0
+	nameLabel.TextSize = 14
+	nameLabel.Font = Enum.Font.SourceSansBold
+	nameLabel.Text = displayName
+	nameLabel.Parent = bgui
+
+	local conns = {}
+
+	table.insert(conns, player.Changed:Connect(function(prop)
+		if prop == "DisplayName" or prop == "Name" then
+			if nameLabel and nameLabel.Parent then
+				nameLabel.Text = player.DisplayName
+			end
+		end
+	end))
+
+	local rootAnc
+	rootAnc = root.AncestryChanged:Connect(function()
+		if not root.Parent then
+			if rootAnc then rootAnc:Disconnect() end
+			cleanupPlayerNameESP(userId)
+		end
+	end)
+	table.insert(conns, rootAnc)
+
+	playerNameESP[userId] = {
+		billboard = bgui,
+		conns = conns,
+	}
+end
+
+local function hookPlayerForNameESP(player)
+	if player == LocalPlayer then return end
+
+	local function onChar(char)
+		task.wait(0.2)
+		applyPlayerNameESP(player, char)
+	end
+
+	if player.Character then onChar(player.Character) end
+	player.CharacterAdded:Connect(onChar)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do hookPlayerForNameESP(p) end
+Players.PlayerAdded:Connect(hookPlayerForNameESP)
+Players.PlayerRemoving:Connect(function(player)
+	cleanupPlayerNameESP(player.UserId)
+end)
+
+-- ====== ХИТБОКСЫ СКВОЗЬ СТЕНЫ ======
+local boxESP = {}
+
+local function cleanupBoxESP(model)
+	local box = boxESP[model]
+	if box and box.Parent then box:Destroy() end
+	boxESP[model] = nil
+end
+
+local function applyBoxESP(model)
+	if not model or not model:IsA("Model") then return end
+	if boxESP[model] then return end
+	if model.Name == LocalPlayer.Name then return end
+
+	local target = model:FindFirstChild("HumanoidRootPart")
+		or model:FindFirstChild("Hitbox")
+		or model:FindFirstChildWhichIsA("BasePart")
+	if not target then return end
+
+	local realPlayer = Players:FindFirstChild(model.Name)
+	local isPlayer = realPlayer ~= nil
+	local color = isPlayer and Col3RGB(0, 170, 255) or Col3RGB(255, 255, 0)
+
+	local box = InstNew("BoxHandleAdornment")
+	box.Name = "Hitbox_ESP_" .. model:GetDebugId()
+	box.Adornee = target
+	box.AlwaysOnTop = true
+	box.ZIndex = 5
+	box.Size = target.Size + Vector3.new(0.3, 0.3, 0.3)
+	box.Transparency = 0.5
+	box.Color3 = color
+	box.Parent = espContainer
+
+	local anc
+	anc = target.AncestryChanged:Connect(function()
+		if not target.Parent then
+			if anc then anc:Disconnect() end
+			cleanupBoxESP(model)
+		end
+	end)
+
+	boxESP[model] = box
+end
+
+-- ====== ОСНОВНОЙ ESP ======
+local function applyFinalHybridESP(object)
+	if object.Name == LocalPlayer.Name then return end
+
+	local root = object:FindFirstChild("HumanoidRootPart") or object:FindFirstChildWhichIsA("BasePart")
+	if not root then return end
+
+	cleanupESP(object)
+
+	local teamAttr = object:GetAttribute("Team")
+	if not teamAttr then
+		local attrSignal
+		attrSignal = object:GetAttributeChangedSignal("Team"):Connect(function()
+			teamAttr = object:GetAttribute("Team")
+			if teamAttr then attrSignal:Disconnect() end
+		end)
+		local elapsed = 0
+		while not teamAttr and elapsed < 2 and object and object.Parent do
+			task.wait(0.1)
+			elapsed += 0.1
+			teamAttr = object:GetAttribute("Team")
+		end
+		if attrSignal and attrSignal.Connected then attrSignal:Disconnect() end
+	end
+
+	local isNextbot = teamAttr == "Nextbot"
+	local isPlayerTeam = teamAttr == "PlayerTeam"
+
+	if not isNextbot and not isPlayerTeam then return end
+
+	if isPlayerTeam then
+		local uniqueId = object:GetDebugId()
+
+		local humanoid = object:FindFirstChildWhichIsA("Humanoid")
+		if not humanoid then
+			local hConn
+			hConn = object.ChildAdded:Connect(function(c)
+				if c:IsA("Humanoid") then humanoid = c; hConn:Disconnect() end
+			end)
+			local waitTime = 0
+			while not humanoid and waitTime < 3 and object and object.Parent do
+				task.wait(0.1); waitTime += 0.1
+				humanoid = object:FindFirstChildWhichIsA("Humanoid")
+			end
+			if hConn and hConn.Connected then hConn:Disconnect() end
+		end
+
+		local weldTarget = root
+			or object:FindFirstChild("Right Leg")
+			or object:FindFirstChild("RightLowerLeg")
+			or object:FindFirstChild("RightFoot")
+
+		local proxyPart = InstNew("Part")
+		proxyPart.Name = "ESP_Proxy_" .. uniqueId
+		proxyPart.Shape = Enum.PartType.Block
+
+		local baseSize = weldTarget.Size
+		proxyPart.Size = Vector3.new(
+			max(baseSize.X, 2) + 1,
+			max(baseSize.Y, 5) + 1,
+			max(baseSize.Z, 1) + 1
+		)
+
+		proxyPart.Transparency = 0.99
+		proxyPart.Material = Enum.Material.ForceField
+		proxyPart.CanCollide = false
+		proxyPart.Massless = true
+		proxyPart.Anchored = false
+		proxyPart.CFrame = weldTarget.CFrame
+		proxyPart.Parent = object
+
+		local weld = InstNew("WeldConstraint")
+		weld.Part0 = proxyPart
+		weld.Part1 = weldTarget
+		weld.Parent = proxyPart
+
+		registerESPElement(object, proxyPart)
+
+		local highlight = InstNew("Highlight")
+		highlight.Name = "BotHighlight_" .. uniqueId
+		highlight.Adornee = proxyPart
+		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		highlight.FillColor = Col3RGB(0, 255, 255)
+		highlight.OutlineColor = Col3RGB(255, 255, 255)
+		highlight.FillTransparency = 0.9
+		highlight.OutlineTransparency = 0
+		highlight.Parent = espContainer
+
+		registerESPElement(object, highlight)
+
+		local ancestryConn
+		ancestryConn = object.AncestryChanged:Connect(function(_, parent)
+			if not parent or not object:IsDescendantOf(Workspace) then
+				ancestryConn:Disconnect()
+				cleanupESP(object)
+			end
+		end)
+		local rootDestroyedConn
+		rootDestroyedConn = root.Destroying:Connect(function()
+			rootDestroyedConn:Disconnect()
+			cleanupESP(object)
+		end)
+
+		local healthConn
+		if humanoid then
+			healthConn = humanoid.HealthChanged:Connect(function(health)
+				if not highlight or not highlight.Parent then return end
+				if health <= 0 then
+					highlight.FillColor = Col3RGB(255, 0, 0)
+					highlight.OutlineColor = Col3RGB(255, 0, 0)
+					highlight.FillTransparency = 0.5
+				else
+					highlight.FillColor = Col3RGB(0, 255, 255)
+					highlight.OutlineColor = Col3RGB(255, 255, 255)
+					highlight.FillTransparency = 0.9
+				end
+			end)
+			if humanoid.Health <= 0 then
+				highlight.FillColor = Col3RGB(255, 0, 0)
+				highlight.OutlineColor = Col3RGB(255, 0, 0)
+				highlight.FillTransparency = 0.5
+			end
+		end
+
+		task.spawn(function()
+			local cam = Workspace.CurrentCamera
+			while not cam and object and object.Parent do
+				cam = Workspace.CurrentCamera
+				if not cam then task.wait(0.1) end
+			end
+			if not cam then return end
+
+			local nearbyTimer = 0
+			local downedLabelHidden = false
+			local accumulatedDownedTime = 0
+			local lastTickTime = nil
+			local timerPaused = true
+
+			while object and object.Parent and highlight and highlight.Parent
+				and object:IsDescendantOf(Workspace) and root and root.Parent do
+
+				local downed = humanoid and humanoid.Health <= 0
+				local isCarried = object:GetAttribute("Carried")
+
+				if downed then
+					highlight.FillColor = Col3RGB(255, 0, 0)
+					highlight.OutlineColor = Col3RGB(255, 0, 0)
+					highlight.FillTransparency = 0.5
+
+					if isCarried then
+						local dl = espContainer:FindFirstChild("DownedLabel_" .. uniqueId)
+						if dl then dl:Destroy() end
+						nearbyTimer = 0
+						downedLabelHidden = false
+						timerPaused = true
+						lastTickTime = nil
+					else
+						local closestNonDownedDist = math.huge
+						for _, otherObj in ipairs(BotFolder:GetChildren()) do
+							if otherObj ~= object and otherObj:GetAttribute("Team") == "PlayerTeam" then
+								local otherHumanoid = otherObj:FindFirstChildWhichIsA("Humanoid")
+								local otherRoot = otherObj:FindFirstChild("HumanoidRootPart")
+								if otherHumanoid and otherHumanoid.Health > 0 and otherRoot then
+									local dist = (root.Position - otherRoot.Position).Magnitude
+									if dist < closestNonDownedDist then
+										closestNonDownedDist = dist
+									end
+								end
+							end
+						end
+
+						if closestNonDownedDist <= DOWNED_HIDE_DISTANCE then
+							nearbyTimer += 0.5
+						else
+							nearbyTimer = 0
+							downedLabelHidden = false
+						end
+
+						if nearbyTimer >= DOWNED_HIDE_DURATION then
+							downedLabelHidden = true
+						end
+
+						if downedLabelHidden then
+							timerPaused = true
+							lastTickTime = nil
+							local dl = espContainer:FindFirstChild("DownedLabel_" .. uniqueId)
+							if dl then dl:Destroy() end
+						else
+							if timerPaused then
+								timerPaused = false
+								lastTickTime = os.clock()
+							end
+
+							if not espContainer:FindFirstChild("DownedLabel_" .. uniqueId) then
+								if object:GetAttribute("WasCarried") then
+									task.wait(2)
+									object:SetAttribute("WasCarried", nil)
+									if not (humanoid and humanoid.Health <= 0) or object:GetAttribute("Carried") then continue end
+								end
+
+								local screenGui = InstNew("ScreenGui")
+								screenGui.Name = "DownedLabel_" .. uniqueId
+								screenGui.IgnoreGuiInset = true
+								screenGui.Parent = espContainer
+								registerESPElement(object, screenGui)
+
+								local container = InstNew("Frame")
+								container.Name = "IndicatorContainer"
+								container.AnchorPoint = Vector2.new(0.5, 0.5)
+								container.BackgroundColor3 = Col3New(0, 0, 0)
+								container.BackgroundTransparency = 0.5
+								container.BorderSizePixel = 0
+								container.AutomaticSize = Enum.AutomaticSize.XY
+								container.Parent = screenGui
+
+								local layout = InstNew("UIListLayout")
+								layout.FillDirection = Enum.FillDirection.Horizontal
+								layout.VerticalAlignment = Enum.VerticalAlignment.Center
+								layout.Padding = UDim.new(0, 4)
+								layout.Parent = container
+
+								local padding = InstNew("UIPadding")
+								padding.PaddingLeft = UDim.new(0, 5)
+								padding.PaddingRight = UDim.new(0, 5)
+								padding.PaddingTop = UDim.new(0, 2)
+								padding.PaddingBottom = UDim.new(0, 2)
+								padding.Parent = container
+
+								local icon = InstNew("ImageLabel")
+								icon.Size = UDim2.new(0, 16, 0, 16)
+								icon.BackgroundTransparency = 1
+								icon.Image = "rbxassetid://134857111376422"
+								icon.ImageColor3 = Col3RGB(255, 0, 0)
+								icon.Parent = container
+
+								local textLabel = InstNew("TextLabel")
+								textLabel.BackgroundTransparency = 1
+								textLabel.AutomaticSize = Enum.AutomaticSize.XY
+								textLabel.TextColor3 = Col3RGB(255, 0, 0)
+								textLabel.TextStrokeTransparency = 0
+								textLabel.TextSize = 14
+								textLabel.Font = Enum.Font.SourceSansBold
+								textLabel.Parent = container
+
+								task.spawn(function()
+									while screenGui and screenGui.Parent and object and object.Parent
+										and humanoid and humanoid.Health <= 0 and not object:GetAttribute("Carried")
+										and object:IsDescendantOf(Workspace) and root and root.Parent do
+
+										if not timerPaused and lastTickTime then
+											local now = os.clock()
+											accumulatedDownedTime += (now - lastTickTime)
+											lastTickTime = now
+										end
+
+										textLabel.Text = string.format("%.0fs", accumulatedDownedTime)
+
+										if root and root.Parent then
+											local viewportSize = cam.ViewportSize
+											local pos, onScreen = cam:WorldToViewportPoint(root.Position)
+											if onScreen then
+												container.Position = UDim2.new(0, pos.X, 0, pos.Y)
+											else
+												local center = viewportSize / 2
+												local direction = (Vector2.new(pos.X, pos.Y) - center).Unit
+												if pos.Z < 0 then direction = -direction end
+												local rads = atan2(direction.Y, direction.X)
+												local c, s = cos(rads), sin(rads)
+												local m_x, m_y = (viewportSize.X / 2) - 45, (viewportSize.Y / 2) - 45
+												local x_val = m_y * (c / abs(s))
+												local y_val = m_x * (s / abs(c))
+												local finalPos = abs(x_val) < m_x and (center + Vector2.new(x_val, m_y * (s / abs(s)))) or (center + Vector2.new(m_x * (c / abs(c)), y_val))
+												container.Position = UDim2.new(0, finalPos.X, 0, finalPos.Y)
+											end
+										end
+										task.wait(0.03)
+									end
+									if screenGui and screenGui.Parent then screenGui:Destroy() end
+								end)
+							end
+						end
+					end
+				else
+					highlight.FillColor = Col3RGB(0, 255, 255)
+					highlight.OutlineColor = Col3RGB(255, 255, 255)
+					highlight.FillTransparency = 0.9
+					local dl = espContainer:FindFirstChild("DownedLabel_" .. uniqueId)
+					if dl then dl:Destroy() end
+					nearbyTimer = 0
+					downedLabelHidden = false
+					accumulatedDownedTime = 0
+					lastTickTime = nil
+					timerPaused = true
+				end
+
+				if isCarried then object:SetAttribute("WasCarried", true) end
+
+				pcall(function()
+					local currentBaseSize = weldTarget.Size
+					proxyPart.Size = Vector3.new(
+						max(currentBaseSize.X, 2) + 1,
+						max(currentBaseSize.Y, 5) + 1,
+						max(currentBaseSize.Z, 1) + 1
+					)
+				end)
+
+				task.wait(0.5)
+			end
+			if healthConn and healthConn.Connected then healthConn:Disconnect() end
+			cleanupESP(object)
+		end)
+		return
+	end
+
+	-- ===== Nextbot =====
+	local isVisible = false
+	for _, part in ipairs(object:GetChildren()) do
+		if part:IsA("BasePart") and part.Transparency < 1 then isVisible = true; break end
+	end
+
+	local targetToAdorn
+	if isVisible then
+		targetToAdorn = object
+	else
+		local internalHitbox = object:FindFirstChild("Hitbox")
+		local nbProxy = InstNew("Part")
+		nbProxy.Name = "ESPHitbox"
+		nbProxy.Shape = Enum.PartType.Block
+		nbProxy.Size = (internalHitbox and internalHitbox:IsA("BasePart")) and internalHitbox.Size or Vector3.new(10, 10, 10)
+		nbProxy.Transparency = 0.99
+		nbProxy.Material = Enum.Material.ForceField
+		nbProxy.CanCollide = false
+		nbProxy.Massless = true
+		local weld = InstNew("WeldConstraint")
+		weld.Part0, weld.Part1 = nbProxy, root
+		nbProxy.CFrame = root.CFrame
+		weld.Parent, nbProxy.Parent = nbProxy, object
+		targetToAdorn = nbProxy
+	end
+
+	local highlight = InstNew("Highlight")
+	highlight.Name = "BotHighlight"
+	highlight.Adornee = targetToAdorn
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.FillColor = Col3RGB(255, 255, 0)
+	highlight.OutlineColor = Col3RGB(255, 255, 255)
+	highlight.FillTransparency = 0.92
+	highlight.OutlineTransparency = 0
+	highlight.Parent = object
+
+	local bgui = InstNew("BillboardGui")
+	bgui.Name = "BotLabels"
+	bgui.Adornee = root
+	bgui.Size = UDim2.new(0, 100, 0, 40)
+	bgui.AlwaysOnTop = true
+	bgui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+
+	local textLabel = InstNew("TextLabel")
+	textLabel.BackgroundTransparency = 1
+	textLabel.Size = UDim2.new(1, 0, 1, 0)
+	textLabel.TextColor3 = Col3RGB(255, 255, 0)
+	textLabel.TextStrokeTransparency = 0
+	textLabel.TextSize = 10
+	textLabel.Font = Enum.Font.SourceSansBold
+	textLabel.Text = object.Name .. "\n[Checking...]"
+	textLabel.Parent = bgui
+	bgui.Parent = object
+
+	task.spawn(function()
+		local offScreenIndicator = nil
+		local cam = Workspace.CurrentCamera
+		while not cam and object and object.Parent do
+			cam = Workspace.CurrentCamera
+			if not cam then task.wait(0.1) end
+		end
+		if not cam then return end
+
+		while object and object.Parent and bgui and bgui.Parent do
+			local char = LocalPlayer.Character
+			local myRoot = char and char:FindFirstChild("HumanoidRootPart")
+			if myRoot then
+				local dist = (myRoot.Position - root.Position).Magnitude
+				local ping = LocalPlayer:GetNetworkPing()
+				local pingBuffer = clamp(ping * BOT_SPEED, 0, 50)
+				local dynamicDanger = 37 + pingBuffer
+				local dynamicWarning = 100 + pingBuffer
+
+				local currentColor = Col3RGB(255, 255, 0)
+				local currentHighlightColor = Col3RGB(255, 255, 0)
+				local currentOutlineColor = Col3RGB(255, 255, 255)
+
+				if dist <= dynamicDanger then
+					currentColor = Col3RGB(255, 0, 0)
+					currentHighlightColor = Col3RGB(255, 0, 0)
+					currentOutlineColor = Col3RGB(255, 0, 0)
+				elseif dist <= dynamicWarning then
+					currentColor = Col3RGB(255, 165, 0)
+					currentHighlightColor = Col3RGB(255, 165, 0)
+					currentOutlineColor = Col3RGB(255, 165, 0)
+				end
+
+				highlight.FillColor = currentHighlightColor
+				highlight.OutlineColor = currentOutlineColor
+				textLabel.TextColor3 = currentColor
+				textLabel.Text = string.format("%s\n[%d studs]", object.Name, floor(dist))
+
+				if dist <= dynamicWarning then
+					local viewportSize = cam.ViewportSize
+					local pos, onScreen = cam:WorldToViewportPoint(root.Position)
+					if not onScreen then
+						if not offScreenIndicator then
+							local screenGui = InstNew("ScreenGui")
+							screenGui.Name = "OffScreen_" .. object.Name
+							screenGui.IgnoreGuiInset = true
+							local success = pcall(function() screenGui.Parent = CoreGui end)
+							if not success then
+								local pg = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+								if pg then screenGui.Parent = pg end
+							end
+							local indicator = InstNew("TextLabel")
+							indicator.Size = UDim2.new(0, 0, 0, 0)
+							indicator.AutomaticSize = Enum.AutomaticSize.XY
+							indicator.BackgroundTransparency = 0.5
+							indicator.BackgroundColor3 = Col3New(0, 0, 0)
+							indicator.TextSize = 12
+							indicator.Font = Enum.Font.SourceSansBold
+							indicator.AnchorPoint = Vector2.new(0.5, 0.5)
+							indicator.BorderSizePixel = 0
+							local padding = InstNew("UIPadding")
+							padding.PaddingLeft = UDim.new(0, 8)
+							padding.PaddingRight = UDim.new(0, 8)
+							padding.PaddingTop = UDim.new(0, 4)
+							padding.PaddingBottom = UDim.new(0, 4)
+							padding.Parent = indicator
+							indicator.Parent = screenGui
+							offScreenIndicator = screenGui
+						end
+						local indicatorLabel = offScreenIndicator:FindFirstChildWhichIsA("TextLabel")
+						if indicatorLabel then
+							indicatorLabel.TextColor3 = currentColor
+							indicatorLabel.Text = string.format("⚠  %s [%dm]", object.Name, floor(dist))
+							local center = viewportSize / 2
+							local direction = (Vector2.new(pos.X, pos.Y) - center).Unit
+							if pos.Z < 0 then direction = -direction end
+							local rads = atan2(direction.Y, direction.X)
+							local c, s = cos(rads), sin(rads)
+							local m_x, m_y = (viewportSize.X / 2) - 50, (viewportSize.Y / 2) - 50
+							local x_val = m_y * (c / abs(s))
+							local y_val = m_x * (s / abs(c))
+							local finalPos = abs(x_val) < m_x and (center + Vector2.new(x_val, m_y * (s / abs(s)))) or (center + Vector2.new(m_x * (c / abs(c)), y_val))
+							indicatorLabel.Position = UDim2.new(0, finalPos.X, 0, finalPos.Y)
+						end
+					elseif offScreenIndicator then
+						offScreenIndicator:Destroy()
+						offScreenIndicator = nil
+					end
+				elseif offScreenIndicator then
+					offScreenIndicator:Destroy()
+					offScreenIndicator = nil
+				end
+			end
+			task.wait(0.03)
+		end
+		if offScreenIndicator then offScreenIndicator:Destroy() end
+	end)
+end
+
+-- ====== ХУКИ ======
+local function setupBot(child)
+	applyBoxESP(child)
+	applyFinalHybridESP(child)
+	child:GetAttributeChangedSignal("Team"):Connect(function()
+		applyFinalHybridESP(child)
+	end)
+end
+
+for _, child in ipairs(BotFolder:GetChildren()) do setupBot(child) end
+BotFolder.ChildAdded:Connect(function(child)
+	task.wait(0.5)
+	setupBot(child)
+end)
+BotFolder.ChildRemoved:Connect(function(child)
+	cleanupESP(child)
+	cleanupBoxESP(child)
+end)
+
+setupTicketsESP()
+
+-- ============================================================
+--  ЧАСТЬ 3: SPEED GUI (V)
+-- ============================================================
+if not getgenv().EvdGuiInit then
+	getgenv().EvdGuiInit = true
+
+	if getgenv().EvdGui then
+		pcall(function() getgenv().EvdGui:Destroy() end)
+	end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "EvadeGui"
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.IgnoreGuiInset = true
+
+	local ok = pcall(function() gui.Parent = CoreGui end)
+	if not ok then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+	getgenv().EvdGui = gui
+
+	local main = Instance.new("Frame")
+	main.Name = "Main"
+	main.Size = UDim2.new(0, 300, 0, 280)
+	main.Position = UDim2.new(0.5, -150, 0.5, -140)
+	main.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+	main.BorderSizePixel = 0
+	main.Active = true
+	main.Draggable = true
+	main.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = main
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(80, 130, 255)
+	stroke.Thickness = 1.5
+	stroke.Parent = main
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, 0, 0, 34)
+	title.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+	title.BorderSizePixel = 0
+	title.Text = "Evade Speed"
+	title.TextColor3 = Color3.fromRGB(230, 230, 255)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 15
+	title.Parent = main
+
+	local titleCorner = Instance.new("UICorner")
+	titleCorner.CornerRadius = UDim.new(0, 10)
+	titleCorner.Parent = title
+
+	local close = Instance.new("TextButton")
+	close.Size = UDim2.new(0, 26, 0, 26)
+	close.Position = UDim2.new(1, -30, 0, 4)
+	close.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+	close.BorderSizePixel = 0
+	close.Text = "X"
+	close.TextColor3 = Color3.fromRGB(255, 255, 255)
+	close.Font = Enum.Font.GothamBold
+	close.TextSize = 13
+	close.Parent = title
+
+	local closeCorner = Instance.new("UICorner")
+	closeCorner.CornerRadius = UDim.new(0, 6)
+	closeCorner.Parent = close
+
+	local list = Instance.new("Frame")
+	list.Size = UDim2.new(1, -20, 1, -50)
+	list.Position = UDim2.new(0, 10, 0, 42)
+	list.BackgroundTransparency = 1
+	list.Parent = main
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 12)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = list
+
+	local function makeButton(parent, text, width, color, order)
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(0, width, 1, 0)
+		btn.BackgroundColor3 = color
+		btn.BorderSizePixel = 0
+		btn.Text = text
+		btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		btn.Font = Enum.Font.GothamBold
+		btn.TextSize = 12
+		btn.LayoutOrder = order
+		btn.Parent = parent
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, 5)
+		c.Parent = btn
+		return btn
+	end
+
+	local saveDebounce = 0
+	local function scheduleSave()
+		local now = os.clock()
+		if now - saveDebounce < 0.4 then return end
+		saveDebounce = now
+		pcall(function() cfg._save() end)
+	end
+
+	local function makeSlider(name, order, minVal, maxVal, default, callback)
+		local holder = Instance.new("Frame")
+		holder.Size = UDim2.new(1, 0, 0, 84)
+		holder.BackgroundTransparency = 1
+		holder.LayoutOrder = order
+		holder.Parent = list
+
+		local topRow = Instance.new("Frame")
+		topRow.Size = UDim2.new(1, 0, 0, 22)
+		topRow.BackgroundTransparency = 1
+		topRow.Parent = holder
+
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.new(0.5, 0, 1, 0)
+		label.BackgroundTransparency = 1
+		label.Text = name
+		label.TextColor3 = Color3.fromRGB(210, 210, 230)
+		label.Font = Enum.Font.GothamBold
+		label.TextSize = 13
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.Parent = topRow
+
+		local inputBox = Instance.new("TextBox")
+		inputBox.Size = UDim2.new(0, 90, 1, 0)
+		inputBox.Position = UDim2.new(1, -90, 0, 0)
+		inputBox.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+		inputBox.BorderSizePixel = 0
+		inputBox.Text = tostring(default)
+		inputBox.TextColor3 = Color3.fromRGB(220, 220, 255)
+		inputBox.Font = Enum.Font.GothamBold
+		inputBox.TextSize = 13
+		inputBox.ClearTextOnFocus = false
+		inputBox.Parent = topRow
+
+		local inputCorner = Instance.new("UICorner")
+		inputCorner.CornerRadius = UDim.new(0, 5)
+		inputCorner.Parent = inputBox
+
+		local inputStroke = Instance.new("UIStroke")
+		inputStroke.Color = Color3.fromRGB(70, 70, 100)
+		inputStroke.Thickness = 1
+		inputStroke.Parent = inputBox
+
+		local bar = Instance.new("Frame")
+		bar.Size = UDim2.new(1, 0, 0, 10)
+		bar.Position = UDim2.new(0, 0, 0, 28)
+		bar.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+		bar.BorderSizePixel = 0
+		bar.Parent = holder
+
+		local barCorner = Instance.new("UICorner")
+		barCorner.CornerRadius = UDim.new(1, 0)
+		barCorner.Parent = bar
+
+		local fill = Instance.new("Frame")
+		fill.Size = UDim2.new((default - minVal) / (maxVal - minVal), 0, 1, 0)
+		fill.BackgroundColor3 = Color3.fromRGB(80, 130, 255)
+		fill.BorderSizePixel = 0
+		fill.Parent = bar
+
+		local fillCorner = Instance.new("UICorner")
+		fillCorner.CornerRadius = UDim.new(1, 0)
+		fillCorner.Parent = fill
+
+		local knob = Instance.new("TextButton")
+		knob.Size = UDim2.new(0, 16, 0, 16)
+		knob.Position = UDim2.new((default - minVal) / (maxVal - minVal), -8, 0.5, -8)
+		knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+		knob.BorderSizePixel = 0
+		knob.Text = ""
+		knob.AutoButtonColor = false
+		knob.Parent = bar
+
+		local knobCorner = Instance.new("UICorner")
+		knobCorner.CornerRadius = UDim.new(1, 0)
+		knobCorner.Parent = knob
+
+		local btnRow = Instance.new("Frame")
+		btnRow.Size = UDim2.new(1, 0, 0, 22)
+		btnRow.Position = UDim2.new(0, 0, 0, 48)
+		btnRow.BackgroundTransparency = 1
+		btnRow.Parent = holder
+
+		local btnLayout = Instance.new("UIListLayout")
+		btnLayout.FillDirection = Enum.FillDirection.Horizontal
+		btnLayout.Padding = UDim.new(0, 5)
+		btnLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		btnLayout.Parent = btnRow
+
+		local function setByValue(val, skipInput)
+			val = math.clamp(math.floor(val + 0.5), minVal, maxVal)
+			local rel = (val - minVal) / (maxVal - minVal)
+			fill.Size = UDim2.new(rel, 0, 1, 0)
+			knob.Position = UDim2.new(rel, -8, 0.5, -8)
+			if not skipInput then inputBox.Text = tostring(val) end
+			callback(val)
+		end
+
+		local function setByRatio(rel, skipInput)
+			rel = math.clamp(rel, 0, 1)
+			local val = math.floor(minVal + (maxVal - minVal) * rel + 0.5)
+			fill.Size = UDim2.new(rel, 0, 1, 0)
+			knob.Position = UDim2.new(rel, -8, 0.5, -8)
+			if not skipInput then inputBox.Text = tostring(val) end
+			callback(val)
+		end
+
+		local function getCurrentValue()
+			return tonumber(inputBox.Text) or default
+		end
+
+		local dragging = false
+		local function updateFromX(x)
+			local rel = (x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X
+			setByRatio(rel)
+		end
+
+		knob.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+			end
+		end)
+
+		bar.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				updateFromX(input.Position.X)
+				dragging = true
+			end
+		end)
+
+		UIS.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch) then
+				updateFromX(input.Position.X)
+			end
+		end)
+
+		UIS.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end)
+
+		inputBox.FocusLost:Connect(function()
+			local num = tonumber(inputBox.Text)
+			if not num then
+				inputBox.Text = tostring(getCurrentValue())
+				return
+			end
+			setByValue(num, true)
+		end)
+
+		local b1 = makeButton(btnRow, "-10", 42, Color3.fromRGB(160, 50, 50), 1)
+		local b2 = makeButton(btnRow, "-1",  36, Color3.fromRGB(160, 70, 70), 2)
+		local b3 = makeButton(btnRow, "+1",  36, Color3.fromRGB(50, 130, 70), 3)
+		local b4 = makeButton(btnRow, "+10", 42, Color3.fromRGB(50, 160, 80), 4)
+		local b5 = makeButton(btnRow, "Reset", 52, Color3.fromRGB(70, 80, 120), 5)
+
+		b1.MouseButton1Click:Connect(function() setByValue(getCurrentValue() - 10) end)
+		b2.MouseButton1Click:Connect(function() setByValue(getCurrentValue() - 1) end)
+		b3.MouseButton1Click:Connect(function() setByValue(getCurrentValue() + 1) end)
+		b4.MouseButton1Click:Connect(function() setByValue(getCurrentValue() + 10) end)
+		b5.MouseButton1Click:Connect(function() setByValue(default) end)
+
+		return { setValue = setByValue, getValue = getCurrentValue }
+	end
+
+	local topSlider = makeSlider("Top Speed", 1, 10, 200, cfg.topSpeed, function(v)
+		cfg.topSpeed = v
+		if cfg.maxSpeed < v then
+			cfg.maxSpeed = v
+			if maxSlider then maxSlider.setValue(v) end
+		end
+		scheduleSave()
+	end)
+
+	local maxSlider = makeSlider("Max Speed", 2, 10, 300, cfg.maxSpeed, function(v)
+		if v < cfg.topSpeed then
+			cfg.maxSpeed = cfg.topSpeed
+			if maxSlider then maxSlider.setValue(cfg.topSpeed) end
+		else
+			cfg.maxSpeed = v
+		end
+		scheduleSave()
+	end)
+
+	close.MouseButton1Click:Connect(function()
+		pcall(function() cfg._save() end)
+		gui.Enabled = false
+	end)
+
+	gui.Enabled = false
+
+	UIS.InputBegan:Connect(function(input, gpe)
+		if gpe then return end
+		if input.KeyCode == Enum.KeyCode.V then
+			gui.Enabled = not gui.Enabled
+		end
+	end)
+end
+
+print("[Evade] Speed + ESP + Ники + Конфиг загружены. GUI — V.")
